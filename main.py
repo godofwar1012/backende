@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Optional, Dict, List
 
+import os
+import logging
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,30 +13,62 @@ import firebase_admin
 from firebase_admin import credentials, firestore, messaging, exceptions as fb_exceptions
 
 # =========================================================
+#  LOGGING
+# =========================================================
+
+logger = logging.getLogger("telechat-backend")
+logging.basicConfig(level=logging.INFO)
+
+
+# =========================================================
 #  FASTAPI
 # =========================================================
 
-app = FastAPI()
+app = FastAPI(title="TeleChat Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # en prod : restreindre
+    allow_origins=["*"],  # ⚠️ en prod : restreindre
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # =========================================================
 #  FIREBASE ADMIN
 # =========================================================
 
-# ⚠️ Chemin vers la clé de compte de service du projet telechat-01
-SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
+# Chemin vers la clé de compte de service
+# Tu peux aussi le passer par variable d'environnement TELECHAT_SERVICE_ACCOUNT
+SERVICE_ACCOUNT_PATH = os.getenv("TELECHAT_SERVICE_ACCOUNT", "serviceAccountKey.json")
 
-cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-firebase_admin.initialize_app(cred)
+if not os.path.exists(SERVICE_ACCOUNT_PATH):
+    logger.error(
+        "Fichier service account introuvable: %s\n"
+        "⚠️ Vérifie que tu as bien copié le JSON téléchargé depuis Firebase.",
+        SERVICE_ACCOUNT_PATH,
+    )
 
-db = firestore.client()
+firebase_app: Optional[firebase_admin.App] = None
+db: firestore.Client | None = None
+
+try:
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+        firebase_app = firebase_admin.initialize_app(cred)
+        logger.info("Firebase Admin initialisé avec succès.")
+    else:
+        # Réutiliser une app existante si le code est rechargé (ex: --reload)
+        firebase_app = list(firebase_admin._apps.values())[0]
+        logger.info("Firebase Admin déjà initialisé, réutilisation de l'instance existante.")
+
+    db = firestore.client()
+    logger.info("Client Firestore initialisé.")
+except Exception as e:
+    logger.exception("Erreur lors de l'initialisation de Firebase Admin / Firestore: %r", e)
+    # On laisse tourner l'API, mais tous les endpoints qui utilisent Firestore devront vérifier db
+
 
 # =========================================================
 #  MODELES
@@ -60,12 +95,30 @@ class TestPushRequest(BaseModel):
 #  HELPERS
 # =========================================================
 
+def ensure_db() -> firestore.Client:
+    """
+    Vérifie que Firestore est bien initialisé.
+    Lève une HTTPException 500 sinon.
+    """
+    if db is None:
+        logger.error("Firestore non initialisé (db est None).")
+        raise HTTPException(
+            status_code=500,
+            detail="Firestore non initialisé côté serveur. Vérifie la clé de service Firebase.",
+        )
+    return db
+
+
 def send_push_to_fcm_token(
     token: str,
     title: str,
     body: str,
     data: Optional[Dict[str, str]] = None,
 ) -> str:
+    """
+    Envoie une notification FCM à un token.
+    Lève une exception si l'envoi échoue.
+    """
     message = messaging.Message(
         token=token,
         notification=messaging.Notification(
@@ -74,16 +127,18 @@ def send_push_to_fcm_token(
         ),
         data=data or {},
     )
-    print(">>> Envoi FCM vers token:", token)
+    logger.info(">>> Envoi FCM vers token: %s", token)
+
     try:
         response = messaging.send(message)
-        print(">>> Réponse FCM message_id:", response)
+        logger.info(">>> Réponse FCM message_id: %s", response)
         return response
     except fb_exceptions.UnregisteredError:
-        print("!!! Token FCM unregistered (mort):", token)
+        logger.warning("!!! Token FCM unregistered (mort): %s", token)
+        # À toi de décider : supprimer le token en base ici si tu veux
         raise
     except Exception as e:
-        print("!!! Erreur générale FCM:", repr(e))
+        logger.exception("!!! Erreur générale FCM: %r", e)
         raise
 
 
@@ -95,7 +150,8 @@ def get_chat_metadata(chat_id: str) -> Dict[str, object]:
     - photoURL: groupPhotoUrl si groupe (jamais la photo d'un user)
     - participants: liste des uids
     """
-    chat_ref = db.collection("chats").document(chat_id)
+    client = ensure_db()
+    chat_ref = client.collection("chats").document(chat_id)
     doc = chat_ref.get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Chat introuvable")
@@ -107,7 +163,6 @@ def get_chat_metadata(chat_id: str) -> Dict[str, object]:
     name = data.get("name") or ("Groupe" if chat_type == "group" else "Utilisateur")
     photo = ""
     if chat_type == "group":
-        # 👉 pour un groupe on prend UNIQUEMENT la photo du groupe
         photo = data.get("groupPhotoUrl") or ""
 
     return {
@@ -135,14 +190,15 @@ def get_user_profile(user_id: str) -> Dict[str, str]:
     - nom : champs 'name' ou 'displayName'
     - photo : champ 'profilePhotoUrl'
     """
-    doc_ref = db.collection("users").document(user_id)
+    client = ensure_db()
+    doc_ref = client.collection("users").document(user_id)
     doc = doc_ref.get()
 
     if not doc.exists:
-        print(f"!!! Profil user {user_id} introuvable dans 'users'")
+        logger.warning("!!! Profil user %s introuvable dans 'users'", user_id)
         return {
             "displayName": "Utilisateur",
-            "photoURL": ""
+            "photoURL": "",
         }
 
     data = doc.to_dict() or {}
@@ -151,15 +207,17 @@ def get_user_profile(user_id: str) -> Dict[str, str]:
 
     return {
         "displayName": display_name,
-        "photoURL": photo_url
+        "photoURL": photo_url,
     }
 
 
 def get_fcm_token_for_user(user_id: str) -> Optional[str]:
-    doc_ref = db.collection("userTokens").document(user_id)
+    client = ensure_db()
+    doc_ref = client.collection("userTokens").document(user_id)
     doc = doc_ref.get()
 
     if not doc.exists:
+        logger.info("Aucun token FCM trouvé pour user_id=%s", user_id)
         return None
 
     data = doc.to_dict() or {}
@@ -175,15 +233,16 @@ def get_fcm_token_for_user(user_id: str) -> Optional[str]:
 async def root():
     return {
         "status": "ok",
-        "message": "Backend TeleChat (FCM + Firestore) en ligne"
+        "message": "Backend TeleChat (FCM + Firestore) en ligne",
     }
 
 
 @app.post("/api/fcm/register")
 async def register_fcm_token(req: FcmRegisterRequest):
+    client = ensure_db()
     try:
-        print(">>> Enregistrement token FCM pour user:", req.user_id)
-        db.collection("userTokens").document(req.user_id).set(
+        logger.info(">>> Enregistrement token FCM pour user: %s", req.user_id)
+        client.collection("userTokens").document(req.user_id).set(
             {
                 "token": req.fcm_token,
                 "userId": req.user_id,
@@ -193,7 +252,7 @@ async def register_fcm_token(req: FcmRegisterRequest):
         )
         return {"success": True}
     except Exception as e:
-        print("!!! Erreur Firestore register_fcm_token:", e)
+        logger.exception("!!! Erreur Firestore register_fcm_token: %r", e)
         raise HTTPException(status_code=500, detail=f"Erreur Firestore: {e}")
 
 
@@ -205,7 +264,7 @@ async def send_message_notification(req: SendMessageNotifRequest):
     - Groupe : titre = nom du groupe, icône = photo du groupe,
                body = "NomExpéditeur : message"
     """
-    print(">>> send-notif reçu:", req.dict())
+    logger.info(">>> send-notif reçu: %s", req.dict())
 
     chat_meta = get_chat_metadata(req.chat_id)
     chat_type = chat_meta["type"]
@@ -220,12 +279,13 @@ async def send_message_notification(req: SendMessageNotifRequest):
         other_members = [uid for uid in participants if uid != req.sender_id]
         if not other_members:
             raise HTTPException(status_code=400, detail="Aucun autre membre dans le groupe")
-        # Ici on en notifie un seul (à étendre si tu veux tous les membres)
+        # Ici on en notifie un seul (à étendre pour tous les membres si tu veux)
         receiver_id = other_members[0]
-    print(">>> Destinataire calculé:", receiver_id)
+
+    logger.info(">>> Destinataire calculé: %s", receiver_id)
 
     token = get_fcm_token_for_user(receiver_id)
-    print(">>> Token FCM destinataire:", token)
+    logger.info(">>> Token FCM destinataire: %s", token)
     if not token:
         return {
             "success": False,
@@ -275,13 +335,13 @@ async def send_message_notification(req: SendMessageNotifRequest):
             "receiver_id": receiver_id,
         }
     except Exception as e:
-        print("!!! Erreur FCM dans send_message_notification:", repr(e))
+        logger.exception("!!! Erreur FCM dans send_message_notification: %r", e)
         raise HTTPException(status_code=500, detail=f"Erreur FCM: {e}")
 
 
 @app.post("/api/fcm/test-push")
 async def test_push(req: TestPushRequest):
-    print(">>> test-push vers token:", req.token)
+    logger.info(">>> test-push vers token: %s", req.token)
     try:
         message_id = send_push_to_fcm_token(
             token=req.token,
@@ -291,5 +351,5 @@ async def test_push(req: TestPushRequest):
         )
         return {"success": True, "message_id": message_id}
     except Exception as e:
-        print("!!! Erreur FCM dans test-push:", repr(e))
+        logger.exception("!!! Erreur FCM dans test-push: %r", e)
         raise HTTPException(status_code=500, detail=f"Erreur FCM: {e}")
